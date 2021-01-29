@@ -1,0 +1,198 @@
+name: Deploy
+
+# Uncomment the below if you want to actually deploy your master branch
+#on:
+#  push:
+#    branches:
+#      - master
+
+jobs:
+  create-sentry-release:
+    name: Create Sentry release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Create Sentry release
+        uses: getsentry/action-release@v1
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: bobe
+          SENTRY_PROJECT: bref-test
+        with:
+          finalize: false
+
+  build-project-code:
+    name: Build prject code
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [ create-sentry-release ]
+    steps:
+      - uses: actions/checkout@v2
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.0'
+          extensions: curl, dom, simplexml, soap, bcmath, mbstring, zip
+
+      - uses: ramsey/composer-install@v1
+        with:
+          composer-options: "--prefer-dist --optimize-autoloader --ignore-platform-reqs"
+
+      - name: Prep for upload
+        run: |
+          touch project-code.tar
+          tar cf project-code.tar --exclude=project-code.tar --exclude=.git/ .
+
+      - name: Upload project code
+        uses: actions/upload-artifact@v2
+        with:
+          name: project-code
+          path: project-code.tar
+          retention-days: 1
+
+  build-assets:
+    name: Build assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [ create-sentry-release ]
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Obtain Yarn Cache directory
+        id: yarn-cache-dir
+        run: echo "::set-output name=dir::$(yarn cache dir)"
+
+      - name: Cache Yarn dependencies
+        uses: actions/cache@v2
+        with:
+          path: ${{ steps.yarn-cache-dir.outputs.dir }}
+          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: ${{ runner.os }}-yarn-
+
+      - name: Install Yarn
+        run: yarn install
+
+      - name: Laravel Mix
+        run: yarn run prod
+
+      - name: Upload assets
+        uses: actions/upload-artifact@v2
+        with:
+          name: assets
+          path: |
+            public
+            !public/index.php
+            !public/.htaccess
+            !public/robots.txt
+            !public/web.config
+            !public/mix-manifest.json
+          retention-days: 1
+
+      - name: Upload mix-manifest.json
+        uses: actions/upload-artifact@v2
+        with:
+          name: mix-manifest
+          path: public/mix-manifest.json
+          retention-days: 1
+
+  deploy-assets:
+    name: Deploy assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [ build-assets ]
+    steps:
+      - name: Download assets
+        uses: actions/download-artifact@v2
+        with:
+          name: assets
+
+      - uses: docker://schoenwaldnils/s3-sync-action:0.5.1
+        with:
+          args: --delete
+        env:
+          AWS_REGION: eu-central-1
+          AWS_S3_BUCKET: bref-test-assets
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+  deploy-serverless:
+    name: Deploy Serverless stack
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [ build-project-code ]
+    steps:
+      - name: Download project code
+        uses: actions/download-artifact@v2
+        with:
+          name: project-code
+
+      - name: Prep for use
+        run: |
+          tar xf project-code.tar
+          rm -f project-code.tar
+
+      - run: ls -alh
+
+      - name: Download mix-manifest.json
+        uses: actions/download-artifact@v2
+        with:
+          name: mix-manifest
+          path: public
+
+      - name: Serverless Deploy
+        uses: serverless/github-action@master
+        # run: npx sls deploy --aws-s3-accelerate
+        with:
+          args: deploy --aws-s3-accelerate
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          RELEASE_HASH: ${{ github.sha }}
+
+  migrate-db:
+    name: Run database migrations
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [ deploy-serverless ]
+    steps:
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.0'
+          extensions: curl, dom, simplexml, soap, bcmath, mbstring, zip
+
+      - name: Download project code
+        uses: actions/download-artifact@v2
+        with:
+          name: project-code
+
+      - name: Prep for use
+        run: |
+          tar xf project-code.tar
+          rm -f project-code.tar
+
+      - name: Run database migration
+        run: vendor/bin/bref cli bref-test-production-artisan -- migrate --force --ansi --no-interaction
+        env:
+          AWS_DEFAULT_REGION: eu-central-1
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+  finalise-sentry-release:
+    name: Finalise Sentry release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [ deploy-assets, migrate-db ]
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Create Sentry release
+        uses: getsentry/action-release@v1
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: bobe
+          SENTRY_PROJECT: bref-test
+        with:
+          environment: production
+          finalize: true

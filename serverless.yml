@@ -1,0 +1,145 @@
+service: laravel-bref-template
+
+provider:
+  name: aws
+  region: eu-central-1
+  runtime: provided.al2
+  stage: production
+
+  environment:
+    APP_NAME: Bref-Test
+    APP_ENV: ${self:provider.region}
+    APP_DEBUG: false
+    APP_KEY: ${ssm:/laravel-bref-template-production/APP_KEY}
+    CACHE_DRIVER: dynamodb
+    SESSION_DRIVER: dynamodb
+    DYNAMODB_CACHE_TABLE: !Ref CacheTable
+    QUEUE_CONNECTION: sqs
+    SQS_QUEUE: !Ref SqsQueue
+    DB_HOST: your-database-url
+    DB_DATABASE: your-database-name
+    DB_USERNAME: ${ssm:/laravel-bref-template-production/DB_USERNAME}
+    DB_PASSWORD: ${ssm:/laravel-bref-template-production/DB_PASSWORD}
+    ASSET_URL: !Join [ '', [ 'https://', !GetAtt AssetsBucket.RegionalDomainName ] ]
+    MIX_ASSET_URL: !Join [ '', [ 'https://', !GetAtt AssetsBucket.RegionalDomainName ] ]
+    RELEASE_HASH: ${env:RELEASE_HASH} # You could use this for sentry release tracking for example
+
+  iamRoleStatements:
+    - Effect: Allow
+      Action: [ sqs:SendMessage, sqs:DeleteMessage ]
+      Resource: !GetAtt SqsQueue.Arn
+    - Effect: Allow
+      Action: [ dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem ]
+      Resource: !GetAtt CacheTable.Arn
+
+  # Configure our API Gateway HTTP API to enable request logging. This is optional.
+  logs:
+    httpApi:
+      format: '{"requestId":"$context.requestId","httpMethod":"$context.httpMethod","status":"$context.status","path":"$context.path","responseLatency":"$context.responseLatency","integrationLatency":"$context.integrationLatency"}'
+
+package:
+  exclude:
+    - .env
+    - node_modules/**
+    - public/storage/**
+    - public/css/**
+    - public/js/**
+    - resources/assets/**
+    - storage/**
+    - tests/**
+
+functions:
+  web:
+    # name: ${self:service}-${self:provider.stage}-web
+    handler: public/index.php
+    memorySize: 1024
+    timeout: 5 # in seconds (API Gateway has a timeout of 29 seconds)
+    reservedConcurrency: 5 # This compares to "capacity" in Vapor
+    layers:
+      - ${bref:layer.php-80-fpm}
+    events:
+      - httpApi: '*'
+      # Also configure our warmer
+      - schedule:
+          rate: rate(5 minutes)
+          input:
+            warmer: true
+            concurrency: 1
+
+  artisan:
+    # name: ${self:service}-${self:provider.stage}-artisan
+    handler: artisan
+    memorySize: 1024
+    timeout: 120 # in seconds
+    layers:
+      - ${bref:layer.php-80} # PHP
+      - ${bref:layer.console} # The "console" layer
+    events:
+      - schedule:
+          rate: rate(1 minute)
+          input: '"schedule:run --ansi --no-interaction --quiet"'
+
+  worker:
+    # name: ${self:service}-${self:provider.stage}-worker
+    handler: worker.php
+    memorySize: 1024
+    timeout: 20 # in seconds
+    reservedConcurrency: 5
+    layers:
+      - ${bref:layer.php-80}
+    events:
+      - sqs:
+          arn: !GetAtt SqsQueue.Arn
+          batchSize: 1
+
+plugins:
+  - ./vendor/bref/bref
+
+resources:
+  Resources:
+    # Website assets
+    AssetsBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: laravel-bref-template-assets
+        AccelerateConfiguration:
+          AccelerationStatus: Enabled
+        CorsConfiguration:
+          CorsRules:
+            - AllowedHeaders: [ "*" ]
+              AllowedMethods: [ GET ]
+              AllowedOrigins: [ "*" ]
+
+    # Policy to make website assets publicly readable
+    AssetsBucketPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        Bucket: !Ref AssetsBucket
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal: '*' # everyone
+              Action: 's3:GetObject' # to read
+              Resource: 'arn:aws:s3:::laravel-bref-template-assets/*'
+
+    # The SQS queue
+    SqsQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        VisibilityTimeout: 30 # Job duration + safety margin
+
+    # Cache table
+    CacheTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: laravel-bref-template-cache
+        AttributeDefinitions:
+          - AttributeName: key
+            AttributeType: S
+        KeySchema:
+          - AttributeName: key
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST
+        TimeToLiveSpecification:
+          AttributeName: expires_at
+          Enabled: true

@@ -9,6 +9,8 @@
     "license": "MIT",
     "require": {
         "php": "^7.3|^8.0",
+        "bref/bref": "^1.1",
+        "bref/laravel-bridge": "dev-sqs-patch",
         "fideloper/proxy": "^4.4",
         "fruitcake/laravel-cors": "^2.0",
         "guzzlehttp/guzzle": "^7.0.1",
@@ -23,6 +25,12 @@
         "nunomaduro/collision": "^5.0",
         "phpunit/phpunit": "^9.3.3"
     },
+    "repositories": [
+        {
+            "type": "vcs",
+            "url": "https://github.com/georgeboot/laravel-bridge"
+        }
+    ],
     "config": {
         "optimize-autoloader": true,
         "preferred-install": "dist",
